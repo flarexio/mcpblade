@@ -2,55 +2,68 @@ package mcpblade
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
 	"go.uber.org/zap"
+
+	"github.com/flarexio/mcpblade/vector"
 )
 
 // Service defines the core logic of MCPBlade.
 type Service interface {
 
+	// Close gracefully shuts down the service and all registered MCP servers.
+	Close() error
+
 	// RegisterMCPServer adds a new MCP server to the registry.
-	RegisterMCPServer(ctx context.Context, id string, config MCPServerConfig, persistnt ...bool) error
+	RegisterMCPServer(ctx context.Context, id string, config MCPServerConfig, persistent ...bool) error
 
-	// // UnregisterMCPServer removes an MCP server from the registry.
-	// UnregisterMCPServer(ctx context.Context, serverID string) error
-
-	// // Heartbeat updates the liveness timestamp of an MCP server.
-	// Heartbeat(ctx context.Context, serverID string) error
+	// UnregisterMCPServer removes an MCP server from the registry.
+	UnregisterMCPServer(ctx context.Context, serverID string, persistent ...bool) error
 
 	// ListTools returns the aggregated tool list (deduplicated),
 	ListTools(ctx context.Context) ([]mcp.Tool, error)
 
-	// // SearchTools searches for tools matching the given query.
-	// SearchTools(ctx context.Context, query string) ([]ToolInfo, error)
+	// SearchTools searches for tools matching the given query.
+	SearchTools(ctx context.Context, query string, k ...int) ([]mcp.Tool, error)
 
-	// // Forward routes an MCP protocol request to an appropriate backend MCP server.
-	// Forward(ctx context.Context, tool string, req *api.Request) (*api.Response, error)
-
-	// // Stream handles long-running or streaming requests.
-	// // It forwards the stream from the backend MCP server to the client via StreamWriter.
-	// Stream(ctx context.Context, tool string, req *api.Request, writer StreamWriter) error
-
-	// // GetMCPServerStatus returns the current registration & heartbeat status.
-	// GetMCPServerStatus(ctx context.Context) ([]ServerStatus, error)
+	// Forward routes an MCP protocol request to an appropriate backend MCP server.
+	Forward(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error)
 }
 
-func NewService(ctx context.Context, cfg Config) Service {
+type ServiceMiddleware func(Service) Service
+
+func NewService(ctx context.Context, cfg Config, vector vector.VectorDB) (Service, error) {
 	log := zap.L().With(
 		zap.String("service", "mcpblade"),
 	)
 
+	ctx, cancel := context.WithCancel(ctx)
+
 	svc := &service{
-		ctx:                 ctx,
-		log:                 log,
-		persistentInstances: make(map[string]client.MCPClient),
-		temporaryInstances:  make(map[string]client.MCPClient),
+		persistentInstances: make(map[string]*MCPServerInstance),
+		temporaryInstances:  make(map[string]*MCPServerInstance),
 		toolRoutes:          make(map[string]string),
 		toolsCache:          make([]mcp.Tool, 0),
+
+		cfg:    cfg,
+		log:    log,
+		ctx:    ctx,
+		cancel: cancel,
+	}
+
+	if vector != nil {
+		collection, err := vector.Collection(cfg.Vector.Collection)
+		if err != nil {
+			return nil, err
+		}
+
+		svc.collection = collection
 	}
 
 	// Register persistent MCP servers
@@ -68,24 +81,79 @@ func NewService(ctx context.Context, cfg Config) Service {
 		log.Info("registered persistent MCP server")
 	}
 
-	// Refresh tools cache immediately on startup
-	svc.refreshToolsCache(ctx)
+	svc.cacheTools(ctx)
 
-	// Start the tools cache refresher worker
-	go svc.runToolsCacheWorker(ctx, cfg.CacheRefreshTTL)
+	go svc.healthMonitor(ctx, cfg.CacheRefreshTTL)
 
-	return svc
+	return svc, nil
 }
 
 type service struct {
-	ctx context.Context
-	log *zap.Logger
+	// Persistent instances and their protection
+	persistentInstances map[string]*MCPServerInstance
 
-	persistentInstances map[string]client.MCPClient // Persistent MCP servers that are always running
-	temporaryInstances  map[string]client.MCPClient // Temporary MCP servers that are created on-demand
-	toolRoutes          map[string]string           // Maps tool names to server IDs
-	toolsCache          []mcp.Tool                  // Cached tools for quick access
-	sync.RWMutex
+	// Temporary instances and their protection
+	temporaryInstances map[string]*MCPServerInstance
+	temporaryMutex     sync.RWMutex
+
+	// Tools cache and routing
+	toolRoutes map[string]string
+	toolsCache []mcp.Tool
+
+	// Vector collection (thread-safe by itself)
+	collection vector.Collection
+
+	cfg    Config
+	log    *zap.Logger
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+func (svc *service) Close() error {
+	log := svc.log.With(
+		zap.String("action", "close"),
+	)
+
+	if svc.cancel != nil {
+		svc.cancel()
+		svc.cancel = nil
+	}
+
+	// Close all persistent MCP clients
+	for id, instance := range svc.persistentInstances {
+		log := log.With(
+			zap.String("server_id", id),
+			zap.String("type", "persistent"),
+		)
+
+		if err := instance.Client.Close(); err != nil {
+			log.Error(err.Error())
+			continue
+		}
+
+		log.Info("closed persistent MCP client")
+	}
+
+	// Close all temporary MCP clients
+	svc.temporaryMutex.Lock()
+	for id, instance := range svc.temporaryInstances {
+		log := log.With(
+			zap.String("server_id", id),
+			zap.String("type", "temporary"),
+		)
+
+		if err := instance.Client.Close(); err != nil {
+			log.Error(err.Error())
+			continue
+		}
+
+		log.Info("closed temporary MCP client")
+	}
+
+	svc.temporaryInstances = make(map[string]*MCPServerInstance)
+	svc.temporaryMutex.Unlock()
+
+	return nil
 }
 
 func (svc *service) RegisterMCPServer(ctx context.Context, id string, config MCPServerConfig, persistent ...bool) error {
@@ -98,13 +166,14 @@ func (svc *service) RegisterMCPServer(ctx context.Context, id string, config MCP
 		return ErrInvalidServerID
 	}
 
-	svc.Lock()
-	defer svc.Unlock()
+	var instances map[string]*MCPServerInstance
 
-	var instances map[string]client.MCPClient
 	if isPersistent {
 		instances = svc.persistentInstances
 	} else {
+		svc.temporaryMutex.Lock()
+		defer svc.temporaryMutex.Unlock()
+
 		instances = svc.temporaryInstances
 	}
 
@@ -155,21 +224,57 @@ func (svc *service) RegisterMCPServer(ctx context.Context, id string, config MCP
 	}
 
 	if _, err := c.Initialize(ctx, req); err != nil {
+		c.Close()
 		return err
 	}
 
-	instances[id] = c
+	instance := &MCPServerInstance{
+		ID:     id,
+		Client: c,
+		Config: config,
+	}
+
+	instance.Beat()
+
+	instances[id] = instance
 
 	return nil
 }
 
-func (svc *service) runToolsCacheWorker(ctx context.Context, ttl time.Duration) {
+func (svc *service) UnregisterMCPServer(ctx context.Context, serverID string, persistent ...bool) error {
+	isPersistent := false
+	if len(persistent) > 0 {
+		isPersistent = persistent[0]
+	}
+
+	if isPersistent {
+		return ErrUnsupportedPersistentServerRemoval
+	}
+
+	if serverID == "" {
+		return ErrInvalidServerID
+	}
+
+	svc.temporaryMutex.Lock()
+	defer svc.temporaryMutex.Unlock()
+
+	instance, ok := svc.temporaryInstances[serverID]
+	if !ok {
+		return ErrServerNotFound
+	}
+
+	delete(svc.temporaryInstances, serverID)
+
+	return instance.Client.Close()
+}
+
+func (svc *service) healthMonitor(ctx context.Context, interval time.Duration) {
 	log := svc.log.With(
-		zap.String("action", "start_tools_cache_refresher"),
-		zap.Duration("ttl", ttl),
+		zap.String("action", "health_monitor"),
+		zap.Duration("interval", interval),
 	)
 
-	ticker := time.NewTicker(ttl)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -179,13 +284,44 @@ func (svc *service) runToolsCacheWorker(ctx context.Context, ttl time.Duration) 
 			return
 
 		case <-ticker.C:
-			log.Info("refreshing tools cache")
-			svc.refreshToolsCache(ctx)
+			log.Info("checking MCP server health")
+
+			for id, instance := range svc.persistentInstances {
+				log := log.With(
+					zap.String("server_id", id),
+					zap.String("type", "persistent"),
+				)
+
+				if err := instance.Client.Ping(ctx); err != nil {
+					log.Error(err.Error())
+					continue
+				}
+
+				instance.Beat()
+				log.Info("server is alive")
+			}
+
+			svc.temporaryMutex.RLock()
+			for id, instance := range svc.temporaryInstances {
+				log := log.With(
+					zap.String("server_id", id),
+					zap.String("type", "temporary"),
+				)
+
+				if err := instance.Client.Ping(ctx); err != nil {
+					log.Error(err.Error())
+					continue
+				}
+
+				instance.Beat()
+				log.Info("server is alive")
+			}
+			svc.temporaryMutex.RUnlock()
 		}
 	}
 }
 
-func (svc *service) refreshToolsCache(ctx context.Context) {
+func (svc *service) cacheTools(ctx context.Context) {
 	log := svc.log.With(
 		zap.String("action", "refresh_tools_cache"),
 	)
@@ -195,7 +331,7 @@ func (svc *service) refreshToolsCache(ctx context.Context) {
 		tools  = make([]mcp.Tool, 0)
 	)
 
-	for id, client := range svc.persistentInstances {
+	for id, instance := range svc.persistentInstances {
 		log := log.With(
 			zap.String("server_id", id),
 		)
@@ -210,11 +346,13 @@ func (svc *service) refreshToolsCache(ctx context.Context) {
 				},
 			}
 
-			results, err := client.ListTools(ctx, req)
+			results, err := instance.Client.ListTools(ctx, req)
 			if err != nil {
 				log.Error(err.Error())
 				continue
 			}
+
+			instance.Beat()
 
 			for _, tool := range results.Tools {
 				log := log.With(
@@ -237,6 +375,21 @@ func (svc *service) refreshToolsCache(ctx context.Context) {
 				}
 
 				tools = append(tools, tool)
+
+				// Add tool to the vector database collection
+				if svc.collection != nil {
+					doc := ToolToDocument(tool, id)
+					existingDoc, err := svc.collection.FindDocument(ctx, doc.ID)
+					if err != nil || existingDoc.ID != doc.ID {
+						err := svc.collection.AddDocument(ctx, doc)
+						if err != nil {
+							log.Error(err.Error())
+							continue
+						}
+
+						log.Info("added tool document to vector collection")
+					}
+				}
 			}
 
 			cursor = results.NextCursor
@@ -250,23 +403,15 @@ func (svc *service) refreshToolsCache(ctx context.Context) {
 		log.Error(ErrNoToolsFound.Error())
 	}
 
-	svc.Lock()
 	svc.toolRoutes = routes
 	svc.toolsCache = tools
-	svc.Unlock()
 
-	log.Info("tools cache refreshed",
-		zap.Int("count", len(tools)))
+	log.Info("tools cached", zap.Int("count", len(tools)))
 }
 
 func (svc *service) ListTools(ctx context.Context) ([]mcp.Tool, error) {
-	svc.RLock()
-	defer svc.RUnlock()
-
-	// Check if a specific server ID is provided in the context
 	serverID, ok := ctx.Value(ServerID).(string)
 	if !ok {
-		// Aggregated mode: return cached tools from all persistent servers
 		if len(svc.toolsCache) == 0 {
 			return nil, ErrNoToolsFound
 		}
@@ -277,8 +422,10 @@ func (svc *service) ListTools(ctx context.Context) ([]mcp.Tool, error) {
 		return tools, nil
 	}
 
-	// Specific server mode: get tools from the specified temporary server
-	client, ok := svc.temporaryInstances[serverID]
+	svc.temporaryMutex.RLock()
+	defer svc.temporaryMutex.RUnlock()
+
+	instance, ok := svc.temporaryInstances[serverID]
 	if !ok {
 		return nil, ErrServerNotFound
 	}
@@ -297,10 +444,12 @@ func (svc *service) ListTools(ctx context.Context) ([]mcp.Tool, error) {
 			},
 		}
 
-		results, err := client.ListTools(ctx, req)
+		results, err := instance.Client.ListTools(ctx, req)
 		if err != nil {
 			return nil, err
 		}
+
+		instance.Beat()
 
 		tools = append(tools, results.Tools...)
 
@@ -315,4 +464,88 @@ func (svc *service) ListTools(ctx context.Context) ([]mcp.Tool, error) {
 	}
 
 	return tools, nil
+}
+
+func (svc *service) SearchTools(ctx context.Context, query string, k ...int) ([]mcp.Tool, error) {
+	if svc.collection == nil {
+		return nil, ErrVectorDBNotSet
+	}
+
+	n := 5 // Default number of results to return
+	if len(k) > 0 && k[0] > 0 {
+		n = k[0]
+	}
+
+	docs, err := svc.collection.Query(ctx, query, n)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(docs) == 0 {
+		return nil, ErrNoToolsFound
+	}
+
+	tools := make([]mcp.Tool, len(docs))
+	for i, doc := range docs {
+		toolJSON, ok := doc.Metadata["tool_json"]
+		if !ok {
+			return nil, ErrInvalidToolDocument
+		}
+
+		var tool mcp.Tool
+		if err := json.Unmarshal([]byte(toolJSON), &tool); err != nil {
+			return nil, err
+		}
+
+		tools[i] = tool
+	}
+
+	return tools, nil
+}
+
+func (svc *service) Forward(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	toolName := req.Params.Name
+
+	serverID, ok := ctx.Value(ServerID).(string)
+	if !ok {
+		id, ok := svc.toolRoutes[toolName]
+		if !ok {
+			return nil, ErrToolNotFound
+		}
+
+		instance, ok := svc.persistentInstances[id]
+		if !ok {
+			return nil, ErrToolNotFound
+		}
+
+		if name, ok := strings.CutPrefix(toolName, id+":"); ok {
+			req.Params.Name = name
+		}
+
+		result, err := instance.Client.CallTool(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+
+		instance.Beat()
+
+		return result, nil
+	}
+
+	svc.temporaryMutex.RLock()
+	defer svc.temporaryMutex.RUnlock()
+
+	instance, ok := svc.temporaryInstances[serverID]
+	if !ok {
+		return nil, ErrToolNotFound
+	}
+
+	result, err := instance.Client.CallTool(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	instance.Beat()
+
+	return result, nil
 }
